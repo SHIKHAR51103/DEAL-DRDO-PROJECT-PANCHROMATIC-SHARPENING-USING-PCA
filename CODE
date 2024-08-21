@@ -1,0 +1,170 @@
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <Eigen/Dense>
+#include <cmath>
+#include <cassert>
+#include <algorithm>
+
+using namespace Eigen;
+using namespace std;
+
+// Function for QR decomposition using Modified Gram-Schmidt
+void qr_decomposition(MatrixXd& A, MatrixXd& Q, MatrixXd& R) {
+    int n = A.cols();
+    Q = A;
+    R = MatrixXd::Zero(n, n);
+
+    for (int k = 0; k < n; ++k) {
+        R(k, k) = Q.col(k).norm();
+        Q.col(k) /= R(k, k);
+        for (int j = k + 1; j < n; ++j) {
+            R(k, j) = Q.col(k).dot(Q.col(j));
+            Q.col(j) -= R(k, j) * Q.col(k);
+        }
+    }
+}
+
+MatrixXd standardize(const MatrixXd& data, VectorXd& mean, VectorXd& std_dev) {
+    mean = data.colwise().mean();
+    std_dev = ((data.rowwise() - mean.transpose()).array().square().colwise().sum() / (data.rows() - 1)).sqrt();
+    MatrixXd standardized_data = (data.rowwise() - mean.transpose()).array().rowwise() / std_dev.transpose().array();
+    return standardized_data;
+}
+
+MatrixXd calculate_covariance(const MatrixXd& data) {
+    MatrixXd covariance_matrix = (data.transpose() * data) / (data.rows() - 1);
+    return covariance_matrix;
+}
+
+void perform_pca(const MatrixXd& data, MatrixXd& principal_components, VectorXd& eigen_values, MatrixXd& eigen_vectors) {
+    MatrixXd centered_data = data.rowwise() - data.colwise().mean();
+    MatrixXd covariance_matrix = calculate_covariance(centered_data);
+
+    // Use QR decomposition for PCA
+    MatrixXd Q, R;
+    qr_decomposition(covariance_matrix, Q, R);
+
+    SelfAdjointEigenSolver<MatrixXd> eigensolver(covariance_matrix);
+    if (eigensolver.info() != Success) {
+        cerr << "Eigenvalue decomposition failed." << endl;
+        exit(1);
+    }
+    eigen_values = eigensolver.eigenvalues().reverse();
+    eigen_vectors = eigensolver.eigenvectors().rowwise().reverse();
+
+    principal_components = centered_data * eigen_vectors;
+}
+
+MatrixXd inverse_transform(const MatrixXd& pca_data, const MatrixXd& eigen_vectors, const VectorXd& mean, const VectorXd& std_dev) {
+    MatrixXd data = pca_data * eigen_vectors.transpose();
+    data = data.array().rowwise() * std_dev.transpose().array();
+    data = data.rowwise() + mean.transpose();
+    return data;
+}
+
+MatrixXd read_image(const string& file_path, int rows, int cols, int channels) {
+    ifstream file(file_path, ios::binary);
+    if (!file) {
+        cerr << "Error opening file: " << file_path << endl;
+        exit(1);
+    }
+
+    vector<uint8_t> buffer(rows * cols * channels);
+    file.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
+    file.close();
+
+    MatrixXd image(rows, cols * channels);
+    for (int i = 0; i < rows; ++i) {
+        for (int j = 0; j < cols * channels; ++j) {
+            image(i, j) = static_cast<double>(buffer[i * cols * channels + j]);
+        }
+    }
+
+    return image;
+}
+
+void write_image(const string& file_path, const MatrixXd& image, int rows, int cols, int channels) {
+    ofstream file(file_path, ios::binary);
+    if (!file) {
+        cerr << "Error opening file: " << file_path << endl;
+        exit(1);
+    }
+
+    vector<uint8_t> buffer(rows * cols * channels);
+    for (int i = 0; i < rows; ++i) {
+        for (int j = 0; j < cols * channels; ++j) {
+            buffer[i * cols * channels + j] = static_cast<uint8_t>(image(i, j));
+        }
+    }
+
+    file.write(reinterpret_cast<char*>(buffer.data()), buffer.size());
+    file.close();
+}
+
+MatrixXd pan_sharpen(const MatrixXd& pan_image, const MatrixXd& mss_image, int mss_channels) {
+    // Flatten the images
+    MatrixXd pan_flat = pan_image;
+    MatrixXd mss_flat = mss_image;
+
+    // Standardize the data
+    VectorXd mss_mean, mss_std_dev;
+    MatrixXd standardized_mss = standardize(mss_flat, mss_mean, mss_std_dev);
+
+    // Perform PCA on MSS image
+    MatrixXd pca_mss, mss_eigen_vectors;
+    VectorXd mss_eigen_values;
+    perform_pca(standardized_mss, pca_mss, mss_eigen_values, mss_eigen_vectors);
+
+    // Standardize the pan image using MSS statistics
+    MatrixXd standardized_pan = (pan_flat.rowwise() - mss_mean.transpose()).array().rowwise() / mss_std_dev.transpose().array();
+
+    // Check dimensions before replacement
+    cout << "pca_mss dimensions: " << pca_mss.rows() << "x" << pca_mss.cols() << endl;
+    cout << "standardized_pan dimensions: " << standardized_pan.rows() << "x" << standardized_pan.cols() << endl;
+
+    if (pca_mss.rows() != standardized_pan.rows() || pca_mss.cols() <= 0) {
+        cerr << "Dimension mismatch during PCA component replacement" << endl;
+        cerr << "pca_mss.rows() = " << pca_mss.rows() << ", standardized_pan.rows() = " << standardized_pan.rows() << endl;
+        cerr << "pca_mss.cols() = " << pca_mss.cols() << endl;
+        exit(1);
+    }
+
+    // Pan-sharpening by replacing the first principal component of MSS with standardized PAN
+    pca_mss.col(0) = standardized_pan.col(0);
+
+    // Inverse transform to get the pan-sharpened image
+    MatrixXd pan_sharpened_image = inverse_transform(pca_mss, mss_eigen_vectors, mss_mean, mss_std_dev);
+
+    // Clip the pixel values to the range [0, 255]
+    pan_sharpened_image = pan_sharpened_image.unaryExpr([](double x) { return min(255.0, max(0.0, x)); });
+
+    return pan_sharpened_image;
+}
+
+int main() {
+    // Paths to input and output images
+    string pan_image_path = "C:\\Users\\SHIKHAR AGARWAL\\OneDrive\\Pictures\\Desktop\\DEAL DRDO PROJECT\\pan_512 x 512.raw";
+    string mss_image_path = "C:\\Users\\SHIKHAR AGARWAL\\OneDrive\\Pictures\\Desktop\\DEAL DRDO PROJECT\\mss_512 x 512 x 3.raw";
+    string output_image_path = "C:\\Users\\SHIKHAR AGARWAL\\OneDrive\\Pictures\\Desktop\\DEAL DRDO PROJECT\\pan_sharpened_image_new29.raw";
+
+    // Image dimensions
+    int pan_rows = 512;
+    int pan_cols = 512;
+    int mss_rows = 512;
+    int mss_cols = 512;
+    int mss_channels = 3; // Assume MSS image has 3 channels
+
+    // Read PAN and MSS images
+    MatrixXd pan_image = read_image(pan_image_path, pan_rows, pan_cols, 1);
+    MatrixXd mss_image = read_image(mss_image_path, mss_rows, mss_cols, mss_channels);
+
+    // Perform pan-sharpening
+    MatrixXd pan_sharpened_image = pan_sharpen(pan_image, mss_image, mss_channels);
+
+    // Write the pan-sharpened image to file
+    write_image(output_image_path, pan_sharpened_image, pan_rows, pan_cols, mss_channels);
+
+    cout << "Pan-sharpening completed successfully!" << endl;
+    return 0;
+}
